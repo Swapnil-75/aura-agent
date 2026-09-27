@@ -41,3 +41,8 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 .env.local
+
+# generated test fixtures/screenshots from scripts/ dev-testing scripts
+# (the .mjs/.ts scripts themselves are kept, just not their binary output)
+scripts/*.wav
+scripts/*.png

@@ -1,96 +1,67 @@
 # Architecture — Aura Skincare AI Voice Agent
 
-## 1. Overview
-
-A browser-based voice customer support agent ("Aria") for a fictional D2C skincare
-brand, Aura Skincare. The customer speaks into their mic; the agent understands,
-reasons, optionally calls a tool to look up order data, and responds with speech —
-all in a single low-latency loop.
-
-## 2. Tech Stack
-
-| Layer | Choice | Why |
-|---|---|---|
-| Voice pipeline | **Gemini Live API** (`gemini-3.1-flash-live-preview` or latest live model) | Free tier via Google AI Studio, native audio-in/audio-out, native function calling, native barge-in / VAD |
-| Frontend | **Next.js (React)** | Fast to scaffold, deploys cleanly to Vercel, good mic/audio APIs support |
-| Backend | Thin Next.js API routes | Issue ephemeral session config, serve mock order data, run post-call summary generation |
-| Mock DB | Static JSON (no real database) | Only 3 orders needed — overkill to stand up a DB |
-| Deployment | **Vercel** | Free, zero-config Next.js hosting |
-| Summary generation | Gemini Flash (text mode, same free key) | Cheap, non-realtime, batch call after transcript is complete |
-
-## 3. High-Level Flow
+"Aria" is a browser-based voice support agent for a fictional D2C skincare brand.
+The customer speaks into their mic; a single Gemini Live session understands the
+speech, reasons over brand policy, optionally looks up order data, and replies in
+audio — all in one realtime loop. When the call ends, a second model turns the
+transcript into a structured summary, and the result is saved to call history.
 
 ```
-[Browser Mic] 
-    → getUserMedia() captures audio
-    → PCM/streamed audio sent over WebSocket to Gemini Live API
-    → Gemini Live: does STT understanding + reasoning + (optional) tool call + TTS
-    → Audio stream returned to browser
-    → Browser plays response through speakers
-    → Loop continues, maintaining session context
-    → On "End Call": full transcript compiled client-side
-    → Transcript sent to a Gemini Flash text call → structured JSON summary generated
-    → UI renders transcript + summary
+Browser mic (getUserMedia + AudioWorklet)
+  → 16kHz PCM streamed over WebSocket to Gemini Live (gemini-3.8-live)
+  → Gemini: understands speech, reasons, optionally calls get_order_details, replies in audio
+  → 24kHz PCM streamed back, played via Web Audio API
+  → Live transcript accumulated turn-by-turn as the call happens
+  → On End Call: transcript sent to /api/calls
+  → /api/calls calls gemini-3.5-flash-lite for a structured JSON summary
+  → Result (transcript + summary) saved to localStorage and shown on a
+    per-call results page, with a feedback form
 ```
 
-## 4. Components
+**Voice pipeline — Gemini Live API (`gemini-3.8-live`).** One realtime
+WebSocket session handles STT, reasoning, native function calling, and TTS, so
+there's no stitched multi-vendor pipeline to keep in sync. `lib/liveSession.ts`
+owns this session end-to-end: it opens the connection with a server-minted
+ephemeral token (never the real API key — minted per-call by
+`app/api/session/route.ts`), sends Aria's persona and brand guardrails from
+`lib/systemPrompt.ts` as the system instruction, captures mic audio through an
+`AudioWorklet` (`public/pcm-recorder-worklet.js`) that converts it to 16kHz PCM,
+plays the returned 24kHz audio via the Web Audio API, and emits the
+Listening/Thinking/Speaking state that drives `components/CallOrb.tsx`. It also
+registers `get_order_details(order_id)` (`lib/tools.ts`) as a callable tool,
+which looks up the id in the mock database (`data/orders.json` — three real
+records plus two placeholders) and returns order data or a clear "not found."
 
-### 4.1 Frontend (`/app`)
-- `CallInterface` — Start Call / End Call buttons, mic permission handling
-- `StateIndicator` — Listening / Thinking / Speaking, driven by Live API session
-  events (e.g. `turn_start`, `turn_complete`, tool-call-in-progress)
-- `TestOrdersPanel` — static card showing ORD-101/102/103 and their details
-- `TranscriptView` — renders chronological transcript after call ends
-- `SummaryView` — renders the structured JSON call outcome
+**Post-call summary — a separate, non-Live model.** Once the call ends, the
+accumulated transcript goes to `/api/calls`, which calls
+`lib/generateSummary.ts` — a `gemini-3.5-flash-lite` text call with a prompt
+enforcing strict JSON output and retry-on-transient-error handling. This is
+deliberately a different model and a different code path from the live voice
+loop: it isn't latency-sensitive, it needs deterministic structured output, and
+keeping it independent means a summary failure can't destabilize an in-progress
+call. (`app/api/summarize/route.ts` exposes the same summary generation as a
+standalone, bare-summary route for isolated use.) The bundled record — id,
+timestamp, transcript, summary — is persisted client-side via
+`lib/callHistory.ts` into `localStorage`; if summary generation fails, the
+transcript is still saved with the real error attached rather than losing the
+call. `app/page.tsx` renders the landing page and the active-call view;
+`app/call/[id]/page.tsx` renders a finished call's transcript, summary, and
+feedback form; `components/HistoryPanel.tsx` lists past calls from
+`localStorage`.
 
-### 4.2 Live Session Manager (`/lib/liveSession.ts`)
-- Opens WebSocket connection to Gemini Live API
-- Sends system prompt (Aria persona + brand policy + guardrails) at session start
-- Registers `get_order_details` as a callable tool
-- Streams mic audio in, streams response audio out
-- Emits UI state events (listening/thinking/speaking)
-- Accumulates a running transcript (both user and agent turns)
+**Why this shape.** No real database — `localStorage` plus a static JSON file
+match the actual scope (a handful of sample orders, a demo call history) and
+avoid persistence infrastructure this project doesn't need; it's also the
+approach that survives Vercel's non-persistent-filesystem serverless model.
+Next.js on Vercel keeps frontend and backend as one deployable project instead
+of provisioning a separate server.
 
-### 4.3 Tool: `get_order_details(order_id)` (`/lib/tools.ts`)
-- Looks up `order_id` in the mock JSON database
-- Returns order data, or a clear "not found" result if the ID doesn't exist
-- Model receives the tool result and phrases the reply naturally
+**Known limitations.** Gemini's free tier is rate-limited (the summary model
+caps out in the tens of requests per minute/day) — fine for a demo, not
+production volume. Gemini's built-in voices aren't Indian-accented; the brand's
+Indian conversational register comes from the persona/script, not true
+accent-matched TTS. Barge-in updates the UI state correctly, but audio already
+queued in the Web Audio playback buffer isn't forcibly cut off. Call history is
+per-browser, not shared across devices.
 
-### 4.4 Mock Order Database (`/data/orders.json`)
-Three records: ORD-101 (Out for Delivery), ORD-102 (Delivered), ORD-103
-(Processing, cancellation-eligible) — matching the assignment spec exactly.
-
-### 4.5 Post-Call Summary Service (`/app/api/summarize/route.ts`)
-- Takes the full transcript as input
-- Calls Gemini Flash (text-only, non-live) with a prompt instructing strict JSON
-  output matching the required schema:
-  ```json
-  {
-    "customer_intent": "ORDER_TRACKING",
-    "order_id": "ORD-101",
-    "resolution_status": "RESOLVED",
-    "call_summary": "..."
-  }
-  ```
-- Parses and returns JSON to the frontend
-
-## 5. Why This Architecture (for the README / interview questions)
-
-- **Single realtime loop over a stitched pipeline**: Gemini Live handles
-  STT + reasoning + tool-calling + TTS in one connection, which minimizes latency
-  and integration surface area given the time budget.
-- **Free-tier-only by design**: no paid services anywhere in the loop — a
-  deliberate trade-off, sacrificing a true Indian-accented voice for zero cost and
-  simplicity (documented as a "next improvement" in the README).
-- **Text model reused for summary**: no need for a second vendor; same Gemini key,
-  different (non-realtime) call, since summary generation isn't latency-sensitive.
-- **No real database**: three static records is proportionate to the assignment
-  scope; a real DB would be over-engineering here.
-
-## 6. Known Limitations
-- Gemini free tier is rate-limited (~15 RPM) — fine for a single demo call, would
-  need a paid tier for concurrent/production traffic.
-- No persistent conversation history across sessions (each call is stateless from
-  a data-storage perspective; only in-session context is maintained).
-- Built-in Gemini Live voices are not Indian-accented; persona/script carries the
-  brand voice instead of true accent-matched TTS.
+See `README.md` for setup instructions and deployment steps.
